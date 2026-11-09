@@ -1,10 +1,12 @@
 // Package hub routes chat messages between connected clients and rooms.
 //
 // One goroutine (Run) owns all room state, so no locks are needed:
-// everything else talks to it through channels.
+// everything else talks to it through channels. The hub never waits on the
+// database: messages go to a persister goroutine and come back once saved.
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sort"
@@ -16,20 +18,45 @@ import (
 	"github.com/Mikewattoski/parley/internal/protocol"
 )
 
-const maxRoomsPerClient = 20
+const (
+	maxRoomsPerClient = 20
+	persistQueueSize  = 1024
+)
+
+// MessageStore saves chat messages. It is optional: without one, messages
+// are broadcast immediately and nothing is kept.
+type MessageStore interface {
+	SaveMessage(ctx context.Context, room string, userID int64, text string) (id int64, ts time.Time, err error)
+}
 
 type inbound struct {
 	client *Client
 	env    protocol.Envelope
 }
 
+type persistJob struct {
+	client *Client
+	room   string
+	text   string
+	cid    string
+}
+
+type persistResult struct {
+	job persistJob
+	id  int64
+	ts  time.Time
+	err error
+}
+
 type Hub struct {
-	reg   chan *Client
-	unreg chan *Client
-	in    chan inbound
-	stop  chan struct{}
-	done  chan struct{}
-	once  sync.Once
+	reg     chan *Client
+	in      chan inbound
+	persist chan persistJob
+	saved   chan persistResult
+	stop    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	store   MessageStore
 
 	// owned by the Run goroutine, never touched elsewhere
 	clients map[*Client]struct{}
@@ -39,8 +66,9 @@ type Hub struct {
 func New() *Hub {
 	return &Hub{
 		reg:     make(chan *Client),
-		unreg:   make(chan *Client),
 		in:      make(chan inbound, 256),
+		persist: make(chan persistJob, persistQueueSize),
+		saved:   make(chan persistResult),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 		clients: make(map[*Client]struct{}),
@@ -48,22 +76,49 @@ func New() *Hub {
 	}
 }
 
+// WithStore enables persistence. Call it before Run.
+func (h *Hub) WithStore(s MessageStore) *Hub {
+	h.store = s
+	return h
+}
+
 // Run is the hub's event loop. Start it once with `go h.Run()`.
 func (h *Hub) Run() {
 	defer close(h.done)
+	if h.store != nil {
+		go h.persistLoop()
+	}
 	for {
 		select {
 		case c := <-h.reg:
 			h.clients[c] = struct{}{}
 			h.sendTo(c, protocol.Envelope{Type: protocol.TypeWelcome, From: c.name})
-		case c := <-h.unreg:
-			h.removeClient(c)
 		case msg := <-h.in:
 			h.handle(msg)
+		case res := <-h.saved:
+			h.handleSaved(res)
 		case <-h.stop:
 			for c := range h.clients {
 				h.removeClient(c)
 			}
+			if h.store != nil {
+				close(h.persist) // only the hub sends on it, so closing here is safe
+			}
+			return
+		}
+	}
+}
+
+// persistLoop saves messages one at a time (preserving order) and hands the
+// results back to the hub.
+func (h *Hub) persistLoop() {
+	for job := range h.persist {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		id, ts, err := h.store.SaveMessage(ctx, job.room, job.client.userID, job.text)
+		cancel()
+		select {
+		case h.saved <- persistResult{job: job, id: id, ts: ts, err: err}:
+		case <-h.done:
 			return
 		}
 	}
@@ -79,12 +134,12 @@ func (h *Hub) Register(c *Client) bool {
 	}
 }
 
-// Unregister removes a client (a no-op if it was already dropped).
+// Unregister removes a client once everything it sent before has been
+// handled: the request travels through the same queue as the client's
+// frames, so warnings and acks queued earlier are still delivered.
+// It is a no-op if the client was already dropped.
 func (h *Hub) Unregister(c *Client) {
-	select {
-	case h.unreg <- c:
-	case <-h.done:
-	}
+	h.Submit(c, protocol.Envelope{Type: protocol.TypeDisconnect})
 }
 
 // Submit hands a client's request to the hub. It returns false if the hub has stopped.
@@ -120,6 +175,10 @@ func (h *Hub) handle(in inbound) {
 		h.typing(c, env.Room)
 	case protocol.TypeInvalid:
 		h.sendError(c, "malformed JSON")
+	case protocol.TypeRateLimited:
+		h.sendError(c, "rate limit exceeded, slow down")
+	case protocol.TypeDisconnect:
+		h.removeClient(c)
 	default:
 		h.sendError(c, "unknown message type")
 	}
@@ -165,21 +224,54 @@ func (h *Hub) leave(c *Client, room string) {
 }
 
 func (h *Hub) message(c *Client, env protocol.Envelope) {
+	if len(env.CID) > protocol.MaxCIDLen {
+		h.sendError(c, "invalid cid")
+		return
+	}
+	cid := env.CID
 	if !c.inRoom(env.Room) {
-		h.sendError(c, "join the room first")
+		h.sendErrorCID(c, "join the room first", cid)
 		return
 	}
 	text := strings.TrimSpace(env.Text)
 	if text == "" || utf8.RuneCountInString(text) > protocol.MaxTextLen {
-		h.sendError(c, "text must be 1-2000 characters")
+		h.sendErrorCID(c, "text must be 1-2000 characters", cid)
 		return
 	}
-	h.broadcast(env.Room, protocol.Envelope{
+
+	if h.store == nil {
+		h.broadcast(env.Room, protocol.Envelope{
+			Type: protocol.TypeMessage, Room: env.Room, From: c.name, Text: text, CID: cid,
+			TS: time.Now().UTC().Format(time.RFC3339Nano),
+		}, nil)
+		return
+	}
+
+	select {
+	case h.persist <- persistJob{client: c, room: env.Room, text: text, cid: cid}:
+	default:
+		h.sendErrorCID(c, "server busy, try again", cid)
+	}
+}
+
+// handleSaved runs when the persister has finished one message.
+func (h *Hub) handleSaved(res persistResult) {
+	c := res.job.client
+	if res.err != nil {
+		log.Printf("save message: %v", res.err)
+		if _, ok := h.clients[c]; ok {
+			h.sendErrorCID(c, "could not save message", res.job.cid)
+		}
+		return
+	}
+	h.broadcast(res.job.room, protocol.Envelope{
 		Type: protocol.TypeMessage,
-		Room: env.Room,
+		ID:   res.id,
+		CID:  res.job.cid,
+		Room: res.job.room,
 		From: c.name,
-		Text: text,
-		TS:   time.Now().UTC().Format(time.RFC3339Nano),
+		Text: res.job.text,
+		TS:   res.ts.UTC().Format(time.RFC3339Nano),
 	}, nil)
 }
 
@@ -232,8 +324,10 @@ func (h *Hub) sendTo(c *Client, env protocol.Envelope) {
 	}
 }
 
-func (h *Hub) sendError(c *Client, msg string) {
-	h.sendTo(c, protocol.Envelope{Type: protocol.TypeError, Error: msg})
+func (h *Hub) sendError(c *Client, msg string) { h.sendErrorCID(c, msg, "") }
+
+func (h *Hub) sendErrorCID(c *Client, msg, cid string) {
+	h.sendTo(c, protocol.Envelope{Type: protocol.TypeError, Error: msg, CID: cid})
 }
 
 func (h *Hub) leaveRoom(c *Client, room string) {

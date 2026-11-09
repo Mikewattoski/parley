@@ -85,14 +85,19 @@ func TestSlowClientIsDropped(t *testing.T) {
 	fast := register(t, h, "fast", 64)
 
 	h.Submit(slow, protocol.Envelope{Type: protocol.TypeJoin, Room: "r"}) // welcome + joined
-	joinRoom(t, h, fast, "r")                                              // presence fills slow's buffer
+	joinRoom(t, h, fast, "r")                                             // presence fills slow's buffer
 	for i := 0; i < 5; i++ {
 		h.Submit(fast, protocol.Envelope{Type: protocol.TypeMessage, Room: "r", Text: "hi"})
 	}
 
-	drainUntilClosed(t, slow)
-	// the room keeps working for everyone else
+	// the room keeps working for everyone else...
 	waitFor(t, fast, ofType(protocol.TypeMessage))
+	// ...and fast sees slow get dropped. Nothing has read slow's channel up to
+	// this point, so the decision was made by the hub and not by the test.
+	waitFor(t, fast, func(e protocol.Envelope) bool {
+		return e.Type == protocol.TypePresence && e.Event == "left" && e.From == "slow"
+	})
+	drainUntilClosed(t, slow)
 }
 
 func TestPresenceWhenClientDisconnects(t *testing.T) {
@@ -166,5 +171,20 @@ func TestEmptyMessageIsRejected(t *testing.T) {
 	got := waitFor(t, c, ofType(protocol.TypeError))
 	if got.Error != "text must be 1-2000 characters" {
 		t.Errorf("error = %q", got.Error)
+	}
+}
+
+func TestDisconnectIsOrderedAfterEarlierMessages(t *testing.T) {
+	h := newTestHub(t)
+	a := register(t, h, "a", 16)
+	b := register(t, h, "b", 16)
+	joinRoom(t, h, a, "r")
+	joinRoom(t, h, b, "r")
+
+	h.Submit(a, protocol.Envelope{Type: protocol.TypeMessage, Room: "r", Text: "last words"})
+	h.Unregister(a)
+
+	if got := waitFor(t, b, ofType(protocol.TypeMessage)); got.Text != "last words" {
+		t.Errorf("b received %+v, want the message sent just before disconnecting", got)
 	}
 }

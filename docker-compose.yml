@@ -1,0 +1,35 @@
+name: parley
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-parley}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-parley_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-parley}
+    ports:
+      - "5433:5432"   # 5433 on the host, so it never clashes with another Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-parley} -d ${POSTGRES_DB:-parley}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations
+    command:
+      [
+        "-path", "/migrations",
+        "-database", "postgres://${POSTGRES_USER:-parley}:${POSTGRES_PASSWORD:-parley_pass}@postgres:5432/${POSTGRES_DB:-parley}?sslmode=disable",
+        "up"
+      ]
+
+volumes:
+  pgdata:

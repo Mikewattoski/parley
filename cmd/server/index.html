@@ -4,20 +4,27 @@
 <meta charset="utf-8">
 <title>Parley: dev test page</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  body { font-family: system-ui, sans-serif; max-width: 680px; margin: 2rem auto; padding: 0 1rem; }
   #log { height: 320px; overflow: auto; border: 1px solid #ccc; padding: 8px; margin: 12px 0; }
   .sys { color: #777; }
+  .old { color: #999; }
   input, button { padding: 6px; }
 </style>
 </head>
 <body>
 <h1>Parley test page</h1>
-<p>User <input id="user" size="12" placeholder="guest"> Room <input id="room" value="general" size="12"> <button id="connect">Connect</button></p>
+<p>
+  User <input id="user" size="12" placeholder="username">
+  Password <input id="pass" type="password" size="12" placeholder="8+ characters">
+  <button id="register">Register</button> <button id="login">Log in</button>
+</p>
+<p>Room <input id="room" value="general" size="12"> <button id="connect" disabled>Connect</button></p>
 <div id="log"></div>
 <form id="form"><input id="text" size="50" placeholder="Type a message" autocomplete="off" disabled> <button id="send" disabled>Send</button></form>
 <script>
 const $ = (id) => document.getElementById(id);
-let ws;
+let token = null;
+let ws = null;
 
 function log(text, cls) {
   const d = document.createElement('div');
@@ -27,41 +34,75 @@ function log(text, cls) {
   $('log').scrollTop = $('log').scrollHeight;
 }
 
-$('connect').onclick = () => {
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(path, { ...opts, headers });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+async function signIn(kind) {
+  try {
+    const body = await api(`/api/${kind}`, {
+      method: 'POST',
+      body: JSON.stringify({ username: $('user').value.trim(), password: $('pass').value }),
+    });
+    token = body.token;
+    log(`signed in as ${body.user.username}`, 'sys');
+    $('connect').disabled = false;
+  } catch (e) {
+    log(`error: ${e.message}`, 'sys');
+  }
+}
+$('register').onclick = () => signIn('register');
+$('login').onclick = () => signIn('login');
+
+$('connect').onclick = async () => {
   if (ws) ws.close();
-  const user = $('user').value.trim();
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws` + (user ? `?user=${encodeURIComponent(user)}` : ''));
-  ws.onopen = () => {
-    log('connected', 'sys');
-    ws.send(JSON.stringify({ type: 'join', room: $('room').value.trim() }));
-    $('text').disabled = false;
-    $('send').disabled = false;
-  };
-  ws.onclose = () => {
-    log('disconnected', 'sys');
-    $('text').disabled = true;
-    $('send').disabled = true;
-  };
-  ws.onmessage = (e) => {
-    const m = JSON.parse(e.data);
-    switch (m.type) {
-      case 'welcome':  log(`you are ${m.from}`, 'sys'); break;
-      case 'joined':   log(`joined ${m.room} (online: ${(m.users || []).join(', ')})`, 'sys'); break;
-      case 'presence': log(`${m.from} ${m.event} ${m.room}`, 'sys'); break;
-      case 'typing':   log(`${m.from} is typing...`, 'sys'); break;
-      case 'message':  log(`[${m.room}] ${m.from}: ${m.text}`); break;
-      case 'error':    log(`error: ${m.error}`, 'sys'); break;
-      default:         log(e.data, 'sys');
-    }
-  };
+  const room = $('room').value.trim();
+  try {
+    const { ticket } = await api('/api/ws-ticket', { method: 'POST' });
+    const page = await api(`/api/rooms/${encodeURIComponent(room)}/messages?limit=20`);
+    page.items.reverse().forEach((m) => log(`[${m.room}] ${m.from}: ${m.text}`, 'old'));
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws?ticket=${encodeURIComponent(ticket)}`);
+    ws.onopen = () => {
+      log('connected', 'sys');
+      ws.send(JSON.stringify({ type: 'join', room }));
+      $('text').disabled = false;
+      $('send').disabled = false;
+    };
+    ws.onclose = () => {
+      log('disconnected', 'sys');
+      $('text').disabled = true;
+      $('send').disabled = true;
+    };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      switch (m.type) {
+        case 'welcome':  log(`you are ${m.from}`, 'sys'); break;
+        case 'joined':   log(`joined ${m.room} (online: ${(m.users || []).join(', ')})`, 'sys'); break;
+        case 'presence': log(`${m.from} ${m.event} ${m.room}`, 'sys'); break;
+        case 'typing':   log(`${m.from} is typing...`, 'sys'); break;
+        case 'message':  log(`[${m.room}] ${m.from}: ${m.text}  (#${m.id})`); break;
+        case 'error':    log(`error: ${m.error}`, 'sys'); break;
+        default:         log(e.data, 'sys');
+      }
+    };
+  } catch (e) {
+    log(`error: ${e.message}`, 'sys');
+  }
 };
 
 $('form').onsubmit = (e) => {
   e.preventDefault();
   const text = $('text').value;
   if (!text || !ws) return;
-  ws.send(JSON.stringify({ type: 'message', room: $('room').value.trim(), text }));
+  const cid = Math.random().toString(36).slice(2);
+  ws.send(JSON.stringify({ type: 'message', room: $('room').value.trim(), text, cid }));
   $('text').value = '';
 };
 </script>

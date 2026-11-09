@@ -1,31 +1,58 @@
-// Package server exposes the hub over HTTP and WebSocket.
+// Package server exposes the hub and the REST API over HTTP.
 package server
 
 import (
-	"fmt"
-	"math/rand/v2"
+	"context"
 	"net/http"
 	"net/url"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 
+	"github.com/Mikewattoski/parley/internal/auth"
 	"github.com/Mikewattoski/parley/internal/hub"
-	"github.com/Mikewattoski/parley/internal/protocol"
+	"github.com/Mikewattoski/parley/internal/model"
 )
 
-type Server struct {
-	hub      *hub.Hub
-	index    []byte
-	origins  map[string]struct{}
-	allowAll bool
-	upgrader websocket.Upgrader
+// Store is what the REST handlers need from the database.
+type Store interface {
+	CreateUser(ctx context.Context, username, passwordHash string) (model.User, error)
+	UserByUsername(ctx context.Context, username string) (model.User, error)
+	ListRooms(ctx context.Context) ([]string, error)
+	History(ctx context.Context, room string, before int64, limit int) ([]model.Message, error)
 }
 
-// New builds the server. origins lists browser origins allowed to connect
-// ("*" allows all); pages served by this server itself are always allowed.
-func New(h *hub.Hub, origins []string, index []byte) *Server {
-	s := &Server{hub: h, index: index, origins: make(map[string]struct{})}
-	for _, o := range origins {
+type Config struct {
+	Hub       *hub.Hub
+	Store     Store
+	Auth      *auth.Service
+	Origins   []string   // browser origins allowed to open a WebSocket ("*" = all)
+	Index     []byte     // the dev test page
+	AuthRate  rate.Limit // register/login attempts per second, per IP
+	AuthBurst int
+}
+
+type Server struct {
+	hub         *hub.Hub
+	store       Store
+	tokens      *auth.Service
+	index       []byte
+	origins     map[string]struct{}
+	allowAll    bool
+	upgrader    websocket.Upgrader
+	authLimiter *ipLimiter
+}
+
+func New(cfg Config) *Server {
+	s := &Server{
+		hub:         cfg.Hub,
+		store:       cfg.Store,
+		tokens:      cfg.Auth,
+		index:       cfg.Index,
+		origins:     make(map[string]struct{}),
+		authLimiter: newIPLimiter(cfg.AuthRate, cfg.AuthBurst),
+	}
+	for _, o := range cfg.Origins {
 		if o == "*" {
 			s.allowAll = true
 			continue
@@ -45,6 +72,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ws", s.handleWS)
+
+	mux.HandleFunc("POST /api/register", s.limitAuth(s.handleRegister))
+	mux.HandleFunc("POST /api/login", s.limitAuth(s.handleLogin))
+	mux.HandleFunc("POST /api/ws-ticket", s.requireAuth(s.handleTicket))
+	mux.HandleFunc("GET /api/rooms", s.requireAuth(s.handleRooms))
+	mux.HandleFunc("GET /api/rooms/{room}/messages", s.requireAuth(s.handleMessages))
 	return mux
 }
 
@@ -76,18 +109,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// handleWS authenticates with a short-lived ticket BEFORE upgrading, so an
+// unauthenticated connection never reaches the hub.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("user")
-	if name == "" {
-		name = fmt.Sprintf("guest-%04d", rand.IntN(10000))
-	}
-	if !protocol.ValidName(name) {
-		http.Error(w, "invalid user name", http.StatusBadRequest)
+	id, err := s.tokens.Verify(r.URL.Query().Get("ticket"), auth.AudienceWS)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return // Upgrade has already written the error response
 	}
-	hub.NewClient(s.hub, conn, name).Serve()
+	hub.NewClient(s.hub, conn, id.Username, id.UserID).Serve()
 }
