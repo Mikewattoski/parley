@@ -15,6 +15,23 @@ make run          # http://localhost:8081 serves a minimal test page
 make test         # go test -race ./...
 ```
 
+## Frontend
+
+A React + TypeScript + Redux Toolkit app in `web/`.
+
+```bash
+make web-install  # once
+make run          # terminal 1: Go server on :8081
+make web-dev      # terminal 2: http://localhost:5173 (proxies /api and /ws to the server)
+make web-test     # Vitest + Testing Library
+```
+
+- **The WebSocket lives in a Redux middleware**, not in a component. It survives re-renders, components only dispatch actions, and the server's frames come back as ordinary actions.
+- **Optimistic sending:** a message appears immediately with a client-generated `cid`. The server's echo carries the same `cid` and the saved `id`, which confirms it. An error with that `cid`, a lost connection, or a 10 s timeout marks it failed, with a Retry button.
+- **Auto-reconnect:** exponential backoff with jitter (up to 30 s), a fresh 30-second ticket for every attempt, rooms rejoined, and the latest history re-fetched to fill the gap. A 401 on the ticket means the session expired, so the app returns to the login screen.
+- **History:** the latest 50 messages, then "Load older" by message-id cursor with the scroll position preserved. The view only follows new messages when the reader is already at the bottom.
+- **Responsive and accessible:** the room list becomes a drawer on phones, messages are announced through a live region, Enter sends and Shift+Enter adds a line, and motion respects `prefers-reduced-motion`.
+
 ## How it works
 
 - **Accounts:** passwords are hashed with bcrypt. Login returns a 24-hour JWT for the REST API.

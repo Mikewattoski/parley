@@ -37,3 +37,17 @@ build:
 
 lint:
 > golangci-lint run ./...
+
+.PHONY: web-install web-dev web-test web-build
+
+web-install:
+> cd web && npm install
+
+web-dev:
+> cd web && npm run dev
+
+web-test:
+> cd web && npm test
+
+web-build:
+> cd web && npm run build
